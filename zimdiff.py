@@ -237,29 +237,47 @@ def cmd_diff(args):
     print(f"  Path index memory: ~{_fmt(mem_total)}, RSS: {_rss_mb()}")
 
     # Phase 3: Compare common entries
+    # Optimization: check metadata (title, type, mimetype, size) before reading
+    # full content. For large ZIMs most time is spent decompressing content from
+    # disk, so skipping unnecessary reads is critical.
     modified_keys = []
     peak_buf = 0
     content_compared = 0
+    skipped_by_meta = 0
 
-    with tqdm(common_keys, desc="Comparing", unit=" entries",
-              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
+    with tqdm(common_keys, desc="Comparing", unit=" entries", miniters=100,
+              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}") as pbar:
         for path in pbar:
             old_e = old.get_entry_by_path(path)
             new_e = new.get_entry_by_path(path)
 
+            # Fast metadata checks (no disk I/O for content)
             if old_e.title != new_e.title:
                 modified_keys.append(path)
+                skipped_by_meta += 1
                 continue
             if old_e.is_redirect != new_e.is_redirect:
                 modified_keys.append(path)
+                skipped_by_meta += 1
                 continue
             if old_e.is_redirect:
                 if old_e.get_redirect_entry().path != new_e.get_redirect_entry().path:
                     modified_keys.append(path)
+                    skipped_by_meta += 1
                 continue
 
-            old_content = bytes(old_e.get_item().content)
-            new_content = bytes(new_e.get_item().content)
+            old_item = old_e.get_item()
+            new_item = new_e.get_item()
+
+            # Size/mimetype differ → modified without reading content
+            if old_item.size != new_item.size or old_item.mimetype != new_item.mimetype:
+                modified_keys.append(path)
+                skipped_by_meta += 1
+                continue
+
+            # Same size — must compare content bytes
+            old_content = bytes(old_item.content)
+            new_content = bytes(new_item.content)
             buf_size = len(old_content) + len(new_content)
             if buf_size > peak_buf:
                 peak_buf = buf_size
@@ -268,9 +286,14 @@ def cmd_diff(args):
             if old_content != new_content:
                 modified_keys.append(path)
 
+            pbar.set_postfix_str(
+                f"mod={len(modified_keys):,} skip={skipped_by_meta:,} read={_fmt(content_compared)}",
+                refresh=False)
+
     changed_keys = added_keys + modified_keys
 
     print(f"  Modified: {len(modified_keys):,}, Unchanged: {len(common_keys) - len(modified_keys):,}")
+    print(f"  Skipped by metadata: {skipped_by_meta:,} (no content read needed)")
     print(f"  Content compared: {_fmt(content_compared)}, Peak buffer: {_fmt(peak_buf)}")
     print(f"  RSS: {_rss_mb()}")
 
