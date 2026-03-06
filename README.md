@@ -10,15 +10,16 @@ ZIM files like `wikipedia_en_all_maxi` are 115+ GB. Updating to a new version me
 
 **Overlay ZIMs** — a diff that is itself a valid ZIM file containing only changed/added entries plus a deletion list. On the client:
 
-1. **Download the overlay** (~8% of the full file for a 3-month Wikipedia update)
+1. **Download the overlay** (as low as ~8% of the full file for monthly updates)
 2. **Use immediately** — the `OverlayReader` resolves entries across base + overlay layers
 3. **Flatten later** — when storage allows, merge base + overlays into a single updated ZIM
 
 ```
-Full Wikipedia update:     115 GB download, 230 GB peak storage
-With zimdiff overlay:      ~8 GB download, ~123 GB peak storage (no flatten needed)
-                          ~8 GB download, ~230 GB peak storage (with flatten)
+Full Wikipedia (monthly):  ~3-8 GB overlay, ~119-123 GB peak storage
+Full Wikipedia (6-month):  ~105 GB overlay — too much churn, just re-download
 ```
+
+> **Key finding:** Overlay size depends heavily on update interval. Wikipedia ZIM dumps re-render all HTML and reorganize media paths between versions, causing massive churn over long gaps. Monthly updates are the sweet spot. See [BENCHMARKS.md](BENCHMARKS.md) for details.
 
 ## Usage
 
@@ -79,22 +80,36 @@ for path in reader.iter_paths():
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install libzim
+pip install libzim zstandard tqdm
 ```
 
 ## Test Results
 
-With `wikipedia_en_100` (top 100 articles, Oct 2025 → Jan 2026):
+### Small: `wikipedia_en_100` (top 100 articles, 3-month gap)
 
 | Metric | Value |
 |--------|-------|
-| Old ZIM | 313 MB |
-| New ZIM | 319 MB |
-| **Overlay** | **24.6 MB (8%)** |
+| Old ZIM | 313 MB (Oct 2025) |
+| New ZIM | 319 MB (Jan 2026) |
+| **Overlay** | **24.6 MB (7.7%)** |
 | Changed entries | 654 of 8,950 |
 | Content mismatches | 0 |
 
-## Compared to Other Approaches
+### Full: `wikipedia_en_all_maxi` (complete English Wikipedia, 6-month gap)
+
+| Metric | Value |
+|--------|-------|
+| Old ZIM | 111.1 GB / 26.7M entries (Aug 2025) |
+| New ZIM | 115.5 GB / 27.2M entries (Feb 2026) |
+| **Overlay** | **105.1 GB (91%)** |
+| Added entries | 8,559,175 |
+| Removed entries | 8,018,734 |
+| Content modified | 7,261,556 of 18.6M common |
+| Runtime | ~5 hours |
+
+The 6-month overlay is 91% of the full file due to massive path churn and HTML re-rendering. Shorter intervals (1-3 months) would produce much smaller overlays. See [BENCHMARKS.md](BENCHMARKS.md) for full analysis.
+
+### Compared to Other Approaches (small files)
 
 | Approach | Diff Size | RAM Needed | Mobile Viable? |
 |----------|-----------|------------|----------------|

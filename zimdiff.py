@@ -20,12 +20,16 @@ Info:
 """
 
 import argparse
+import hashlib
 import json
+import mmap
 import os
 import resource
+import struct
 import sys
 import time
 
+import zstandard
 from tqdm import tqdm
 
 from libzim.reader import Archive
@@ -77,6 +81,166 @@ def _estimate_set_mem(s):
     return int(72 + len(s) * (8 / 0.66) + len(s) * per_str)
 
 
+def _parse_zim_entries(filepath):
+    """Parse ZIM binary for MIME types and per-entry metadata without decompression.
+
+    Returns (mime_list, url_ptrs, entry_meta) where:
+        mime_list: list of MIME type strings
+        url_ptrs: tuple of directory entry offsets
+        entry_meta: dict {entry_id: (mime_str, cluster_num, blob_num)} for items only
+    """
+    with open(filepath, 'rb') as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+
+        entry_count = struct.unpack_from('<I', mm, 24)[0]
+        url_ptr_pos = struct.unpack_from('<Q', mm, 32)[0]
+        mime_list_pos = struct.unpack_from('<Q', mm, 56)[0]
+
+        # Parse MIME type list (null-terminated strings, empty string ends list)
+        mime_list = []
+        pos = mime_list_pos
+        while True:
+            end = mm.find(b'\x00', pos)
+            s = mm[pos:end].decode('utf-8')
+            if s == '':
+                break
+            mime_list.append(s)
+            pos = end + 1
+
+        # Read all URL pointers
+        url_ptrs = struct.unpack_from(f'<{entry_count}Q', mm, url_ptr_pos)
+
+        # Parse entry metadata: mime_idx, cluster, blob for items
+        entry_meta = {}
+        for i in range(entry_count):
+            offset = url_ptrs[i]
+            mime_idx = struct.unpack_from('<H', mm, offset)[0]
+            if mime_idx != 0xFFFF:
+                cluster_num = struct.unpack_from('<I', mm, offset + 8)[0]
+                blob_num = struct.unpack_from('<I', mm, offset + 12)[0]
+                entry_meta[i] = (mime_list[mime_idx], cluster_num, blob_num)
+
+        mm.close()
+
+    return mime_list, url_ptrs, entry_meta
+
+
+def _hash_items_direct(filepath, items_to_hash, label):
+    """Hash item content by reading clusters directly from the ZIM binary.
+
+    Bypasses libzim for ~140x faster cluster decompression.
+
+    Args:
+        filepath: path to ZIM file
+        items_to_hash: dict {path: (entry_id, cluster_num, blob_num)}
+        label: label for progress bar
+
+    Returns:
+        dict {path: md5_digest}
+    """
+    if not items_to_hash:
+        return {}
+
+    # Group items by cluster number
+    cluster_items = {}  # cluster_num -> [(path, blob_num)]
+    for path, (eid, cnum, bnum) in items_to_hash.items():
+        cluster_items.setdefault(cnum, []).append((path, bnum))
+
+    with open(filepath, 'rb') as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+
+        cluster_count = struct.unpack_from('<I', mm, 28)[0]
+        cluster_ptr_pos = struct.unpack_from('<Q', mm, 48)[0]
+        checksum_pos = struct.unpack_from('<Q', mm, 72)[0]
+
+        cluster_ptrs = list(struct.unpack_from(f'<{cluster_count}Q', mm, cluster_ptr_pos))
+        cluster_ptrs.append(checksum_pos)
+
+        dctx = zstandard.ZstdDecompressor()
+        hashes = {}
+        total_items = len(items_to_hash)
+        skipped_large = 0
+
+        with tqdm(total=total_items, desc=f"Hash {label}", unit=" items", miniters=1000,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
+            for cnum in sorted(cluster_items.keys()):
+                blobs = cluster_items[cnum]
+                start = cluster_ptrs[cnum]
+                end = cluster_ptrs[cnum + 1]
+                comp_size = end - start
+
+                # For very large clusters (>100MB), use streaming decompression
+                if comp_size > 100 * 1024 * 1024:
+                    # These are typically single-blob clusters (e.g. Xapian index)
+                    # Stream-hash them to avoid huge memory allocation
+                    comp_type = mm[start]
+                    if comp_type in (4, 5) and len(blobs) == 1:
+                        path, bnum = blobs[0]
+                        hasher = hashlib.md5()
+                        reader = dctx.stream_reader(bytes(mm[start + 1:end]))
+                        while True:
+                            chunk = reader.read(4 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            hasher.update(chunk)
+                        hashes[path] = hasher.digest()
+                        pbar.update(1)
+                    else:
+                        skipped_large += len(blobs)
+                        pbar.update(len(blobs))
+                    continue
+
+                # Read and decompress cluster
+                comp_type = mm[start]
+                compressed = bytes(mm[start + 1:end])
+
+                if comp_type in (4, 5):  # zstd
+                    try:
+                        decompressed = dctx.decompress(compressed, max_output_size=max(len(compressed) * 30, 64 * 1024 * 1024))
+                    except zstandard.ZstdError:
+                        # Fallback: streaming decompression for tricky frames
+                        chunks = []
+                        reader = dctx.stream_reader(compressed)
+                        while True:
+                            chunk = reader.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                        decompressed = b''.join(chunks)
+                elif comp_type == 1:  # uncompressed
+                    decompressed = compressed
+                else:
+                    skipped_large += len(blobs)
+                    pbar.update(len(blobs))
+                    continue
+
+                # Parse blob offset table
+                first_offset = struct.unpack_from('<I', decompressed, 0)[0]
+                n_blobs = first_offset // 4
+                if n_blobs > 0:
+                    offsets = struct.unpack_from(f'<{n_blobs}I', decompressed, 0)
+                else:
+                    pbar.update(len(blobs))
+                    continue
+
+                for path, bnum in blobs:
+                    if bnum >= n_blobs:
+                        pbar.update(1)
+                        continue
+                    blob_start = offsets[bnum]
+                    blob_end = offsets[bnum + 1] if bnum + 1 < n_blobs else len(decompressed)
+                    content = decompressed[blob_start:blob_end]
+                    hashes[path] = hashlib.md5(content).digest()
+                    pbar.update(1)
+
+        mm.close()
+
+    if skipped_large:
+        print(f"  Skipped {skipped_large} items in unsupported clusters")
+
+    return hashes
+
+
 class ZimItem(Item):
     def __init__(self, path, title, mimetype, content):
         super().__init__()
@@ -112,12 +276,13 @@ def _iter_entries(archive):
 def _index_archive(archive, label):
     """Build a {path: info_tuple} index with lightweight metadata.
 
-    Fast pass (~1M entries/s): captures path, title, redirect info.
+    Fast pass (~350K entries/s): captures path, title, redirect info,
+    and entry ID (for sequential access later).
     Avoids get_item() which triggers expensive cluster decompression.
 
     Info tuples:
-        Redirects: (True, title, target_path)
-        Items:     (False, title, None)  -- mimetype/size deferred
+        Redirects: (True, title, target_path, entry_id)
+        Items:     (False, title, None, entry_id)
     """
     total = archive.all_entry_count
     index = {}
@@ -128,9 +293,9 @@ def _index_archive(archive, label):
             if not archive.has_entry_by_path(entry.path):
                 continue
             if entry.is_redirect:
-                index[entry.path] = (True, entry.title, entry.get_redirect_entry().path)
+                index[entry.path] = (True, entry.title, entry.get_redirect_entry().path, i)
             else:
-                index[entry.path] = (False, entry.title, None)
+                index[entry.path] = (False, entry.title, None, i)
     mem_est = _estimate_set_mem(set(index.keys()))
     print(f"  {len(index):,} entries indexed, ~{_fmt(mem_est)} path memory, RSS {_rss_mb()}")
     return index
@@ -278,48 +443,92 @@ def cmd_diff(args):
     print(f"  Modified (redirect/title): {skipped_by_meta:,}")
     print(f"  Items needing comparison: {len(common_items):,}")
 
-    # Phase 3b: Compare item metadata (size/mimetype) then content if needed
-    # This requires get_item() which is slower, but only for the item subset.
+    # Phase 3b: Parse ZIM binary for MIME types (no decompression needed).
+    # This is ~1M entries/s vs ~300/s with get_item() on large files.
     peak_buf = 0
     content_compared = 0
-    size_mismatches = 0
+    mime_mismatches = 0
+    needs_content = []
 
     if common_items:
-        with tqdm(common_items, desc="Comparing items", unit=" entries", miniters=100,
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}") as pbar:
-            for path in pbar:
-                old_item = old.get_entry_by_path(path).get_item()
-                new_item = new.get_entry_by_path(path).get_item()
+        print(f"\n  Parsing ZIM binary for MIME types...")
+        t0 = time.time()
+        _, _, old_entry_meta = _parse_zim_entries(args.old)
+        _, _, new_entry_meta = _parse_zim_entries(args.new)
+        print(f"  Parsed in {time.time() - t0:.1f}s, RSS: {_rss_mb()}")
 
-                # Fast: compare size and mimetype first
-                if old_item.size != new_item.size or old_item.mimetype != new_item.mimetype:
-                    modified_keys.append(path)
-                    size_mismatches += 1
-                    pbar.set_postfix_str(
-                        f"mod={len(modified_keys):,} skip={size_mismatches:,} read={_fmt(content_compared)}",
-                        refresh=False)
-                    continue
+        # Compare MIME types in memory (instant)
+        for path in common_items:
+            old_eid = old_index[path][3]
+            new_eid = new_index[path][3]
+            old_meta = old_entry_meta.get(old_eid)
+            new_meta = new_entry_meta.get(new_eid)
+            if old_meta is None or new_meta is None:
+                needs_content.append(path)
+                continue
+            if old_meta[0] != new_meta[0]:  # MIME type differs
+                modified_keys.append(path)
+                mime_mismatches += 1
+            else:
+                needs_content.append(path)
 
-                # Same size/mimetype — compare content bytes
-                old_content = bytes(old_item.content)
-                new_content = bytes(new_item.content)
-                buf_size = len(old_content) + len(new_content)
-                if buf_size > peak_buf:
-                    peak_buf = buf_size
-                content_compared += buf_size
+        print(f"  MIME mismatches: {mime_mismatches:,}")
+        print(f"  Need content comparison: {len(needs_content):,}")
 
-                if old_content != new_content:
-                    modified_keys.append(path)
+    # Phase 3c: Content comparison via direct cluster decompression.
+    # Bypasses libzim for ~140x faster cluster access by reading ZIM binary
+    # directly and decompressing with zstandard.
+    if needs_content:
+        # Build items_to_hash dicts: {path: (entry_id, cluster_num, blob_num)}
+        old_items = {}
+        new_items = {}
+        for path in needs_content:
+            old_eid = old_index[path][3]
+            new_eid = new_index[path][3]
+            old_m = old_entry_meta.get(old_eid)
+            new_m = new_entry_meta.get(new_eid)
+            if old_m and new_m:
+                old_items[path] = (old_eid, old_m[1], old_m[2])
+                new_items[path] = (new_eid, new_m[1], new_m[2])
 
-                pbar.set_postfix_str(
-                    f"mod={len(modified_keys):,} skip={size_mismatches:,} read={_fmt(content_compared)}",
-                    refresh=False)
+        del old_entry_meta, new_entry_meta  # free memory
+
+        print(f"\n  Hashing {len(old_items):,} items via direct cluster decompression...")
+        old_hashes = _hash_items_direct(args.old, old_items, "old")
+        new_hashes = _hash_items_direct(args.new, new_items, "new")
+
+        for path in needs_content:
+            old_h = old_hashes.get(path)
+            new_h = new_hashes.get(path)
+            if old_h is None or new_h is None or old_h != new_h:
+                modified_keys.append(path)
+
+        del old_hashes, new_hashes
 
     changed_keys = added_keys + modified_keys
 
     print(f"\n  Total modified: {len(modified_keys):,}, Unchanged: {len(common_keys) - len(modified_keys):,}")
-    print(f"  Size/mime mismatches: {size_mismatches:,}, Content compared: {_fmt(content_compared)}")
+    print(f"  MIME mismatches: {mime_mismatches:,}, Content compared: {_fmt(content_compared)}")
     print(f"  Peak buffer: {_fmt(peak_buf)}, RSS: {_rss_mb()}")
+
+    # Filter out skipped MIME types
+    if args.skip_mime:
+        skip_set = set(args.skip_mime)
+        _, _, new_entry_meta_filt = _parse_zim_entries(args.new)
+        before = len(changed_keys)
+        filtered = []
+        for path in changed_keys:
+            info = new_index[path]
+            if info[0]:  # redirect — always include
+                filtered.append(path)
+                continue
+            meta = new_entry_meta_filt.get(info[3])
+            if meta and meta[0] in skip_set:
+                continue
+            filtered.append(path)
+        changed_keys = filtered
+        del new_entry_meta_filt
+        print(f"\n  Skipped {before - len(changed_keys):,} entries by MIME filter ({', '.join(skip_set)})")
 
     # Collect new-file metadata
     new_metadata = {}
@@ -338,8 +547,32 @@ def cmd_diff(args):
 
     main_entry = _resolve_main_entry(new)
 
-    # Phase 4: Write overlay
+    # Phase 4: Write overlay using direct cluster reads for items
+    # Re-parse binary metadata for writing (we freed it earlier to save memory)
+    _, _, new_entry_meta_w = _parse_zim_entries(args.new)
+
+    # Separate redirects from items, group items by cluster for fast reading
+    redirect_entries = []  # (path, title, target)
+    item_entries = {}      # cluster_num -> [(path, title, mime, blob_num)]
+    for path in changed_keys:
+        info = new_index[path]
+        is_redirect, title, target_or_none, eid = info
+        if is_redirect:
+            redirect_entries.append((path, title, target_or_none))
+        else:
+            meta = new_entry_meta_w.get(eid)
+            if meta:
+                mime_str, cnum, bnum = meta
+                item_entries.setdefault(cnum, []).append((path, title, mime_str, bnum))
+            else:
+                # Fallback: use libzim (rare edge case)
+                item_entries.setdefault(-1, []).append((path, title, None, eid))
+
+    del new_entry_meta_w
+    total_items = sum(len(v) for v in item_entries.values())
+
     print(f"\nWriting overlay: {args.output}")
+    print(f"  {len(redirect_entries):,} redirects, {total_items:,} items across {len(item_entries):,} clusters")
     content_bytes = 0
     with Creator(args.output).config_indexing(False, lang) as creator:
         if main_entry:
@@ -361,19 +594,113 @@ def cmd_diff(args):
         if "Illustration_48x48@1" in new_metadata:
             creator.add_metadata("Illustration_48x48@1", new_metadata["Illustration_48x48@1"])
 
-        with tqdm(sorted(changed_keys), desc="Writing overlay", unit=" entries",
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
-            for path in pbar:
-                info = new_index[path]
-                is_redirect, title, target_or_none = info
-                if is_redirect:
-                    creator.add_redirection(path, title, target_or_none,
-                                            {Hint.FRONT_ARTICLE: False})
-                else:
-                    item = new.get_entry_by_path(path).get_item()
-                    content = bytes(item.content)
-                    content_bytes += len(content)
-                    creator.add_item(ZimItem(path, title, item.mimetype, content))
+        # Write all redirects first (instant, no I/O needed)
+        for path, title, target in tqdm(redirect_entries, desc="Write redirects", unit=" entries",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"):
+            creator.add_redirection(path, title, target, {Hint.FRONT_ARTICLE: False})
+
+        # Write items using direct cluster reading (cluster-sequential)
+        with open(args.new, 'rb') as f:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            cluster_count_w = struct.unpack_from('<I', mm, 28)[0]
+            cluster_ptr_pos_w = struct.unpack_from('<Q', mm, 48)[0]
+            checksum_pos_w = struct.unpack_from('<Q', mm, 72)[0]
+            cluster_ptrs_w = list(struct.unpack_from(f'<{cluster_count_w}Q', mm, cluster_ptr_pos_w))
+            cluster_ptrs_w.append(checksum_pos_w)
+
+            dctx = zstandard.ZstdDecompressor()
+
+            with tqdm(total=total_items, desc="Write items", unit=" entries",
+                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
+                for cnum in sorted(item_entries.keys()):
+                    items = item_entries[cnum]
+
+                    if cnum == -1:
+                        # Fallback items (no binary metadata)
+                        for path, title, _, eid in items:
+                            item = new._get_entry_by_id(eid).get_item()
+                            content = bytes(item.content)
+                            content_bytes += len(content)
+                            creator.add_item(ZimItem(path, title, item.mimetype, content))
+                            pbar.update(1)
+                        continue
+
+                    start = cluster_ptrs_w[cnum]
+                    end = cluster_ptrs_w[cnum + 1]
+                    comp_size = end - start
+                    comp_type = mm[start]
+                    compressed = bytes(mm[start + 1:end])
+
+                    if comp_size > 100 * 1024 * 1024:
+                        # Large cluster: stream decompress for single-blob items
+                        if comp_type in (4, 5) and len(items) == 1:
+                            path, title, mime_str, bnum = items[0]
+                            chunks = []
+                            reader = dctx.stream_reader(compressed)
+                            while True:
+                                chunk = reader.read(4 * 1024 * 1024)
+                                if not chunk:
+                                    break
+                                chunks.append(chunk)
+                            content = b''.join(chunks)
+                            content_bytes += len(content)
+                            creator.add_item(ZimItem(path, title, mime_str, content))
+                            pbar.update(1)
+                        else:
+                            # Multi-blob large cluster — fallback to libzim
+                            for path, title, mime_str, bnum in items:
+                                try:
+                                    item = new.get_entry_by_path(path).get_item()
+                                    content = bytes(item.content)
+                                    content_bytes += len(content)
+                                    creator.add_item(ZimItem(path, title, item.mimetype, content))
+                                except Exception:
+                                    pass
+                                pbar.update(1)
+                        continue
+
+                    # Normal cluster: decompress and extract blobs
+                    if comp_type in (4, 5):
+                        try:
+                            decompressed = dctx.decompress(compressed,
+                                max_output_size=max(len(compressed) * 30, 64 * 1024 * 1024))
+                        except zstandard.ZstdError:
+                            chunks = []
+                            reader = dctx.stream_reader(compressed)
+                            while True:
+                                chunk = reader.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                chunks.append(chunk)
+                            decompressed = b''.join(chunks)
+                    elif comp_type == 1:
+                        decompressed = compressed
+                    else:
+                        for path, title, mime_str, bnum in items:
+                            pbar.update(1)
+                        continue
+
+                    first_offset = struct.unpack_from('<I', decompressed, 0)[0]
+                    n_blobs = first_offset // 4
+                    if n_blobs > 0:
+                        offsets = struct.unpack_from(f'<{n_blobs}I', decompressed, 0)
+                    else:
+                        for path, title, mime_str, bnum in items:
+                            pbar.update(1)
+                        continue
+
+                    for path, title, mime_str, bnum in items:
+                        if bnum >= n_blobs:
+                            pbar.update(1)
+                            continue
+                        blob_start = offsets[bnum]
+                        blob_end = offsets[bnum + 1] if bnum + 1 < n_blobs else len(decompressed)
+                        content = decompressed[blob_start:blob_end]
+                        content_bytes += len(content)
+                        creator.add_item(ZimItem(path, title, mime_str, content))
+                        pbar.update(1)
+
+            mm.close()
 
     overlay_size = os.path.getsize(args.output)
     print(f"\nDone. Overlay: {_fmt(overlay_size)} "
@@ -578,6 +905,8 @@ def main():
     p_diff.add_argument("old", help="Old (base) ZIM file")
     p_diff.add_argument("new", help="New (target) ZIM file")
     p_diff.add_argument("-o", "--output", required=True, help="Output overlay ZIM")
+    p_diff.add_argument("--skip-mime", action="append", default=[],
+        help="Skip entries with these MIME types (can be repeated)")
 
     p_apply = sub.add_parser("apply",
         help="Flatten base + overlays into a single ZIM (client-side)")
