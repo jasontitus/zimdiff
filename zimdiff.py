@@ -22,8 +22,11 @@ Info:
 import argparse
 import json
 import os
+import resource
 import sys
 import time
+
+from tqdm import tqdm
 
 from libzim.reader import Archive
 from libzim.writer import Creator, Item, StringProvider, Hint
@@ -35,9 +38,43 @@ BASE_UUID_META_KEY = "zimdiff.base_uuid"
 BASE_CHECKSUM_META_KEY = "zimdiff.base_checksum"
 TARGET_UUID_META_KEY = "zimdiff.target_uuid"
 VERSION_META_KEY = "zimdiff.version"
-# Stacking: the overlay also records what it was built against so
-# sequential overlays can be validated
 PARENT_UUID_META_KEY = "zimdiff.parent_uuid"
+
+
+def _fmt(num_bytes):
+    """Format byte count as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(num_bytes) < 1024:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} PB"
+
+
+def _rss():
+    """Current RSS in bytes."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+
+def _rss_mb():
+    """Current RSS as human string. macOS reports bytes, Linux reports KB."""
+    raw = _rss()
+    if sys.platform == "darwin":
+        return _fmt(raw)
+    return _fmt(raw * 1024)
+
+
+def _estimate_set_mem(s):
+    """Rough memory estimate for a set of strings."""
+    if not s:
+        return 0
+    # set overhead + per-element pointer + string objects
+    # Average string length approximation from sample
+    sample = list(s)[:1000]
+    avg_len = sum(len(x) for x in sample) / len(sample)
+    # CPython string: 49 bytes base + 1 byte per char (ASCII)
+    per_str = 49 + avg_len
+    # set: ~72 bytes overhead + 8 bytes per bucket (load factor ~0.66)
+    return int(72 + len(s) * (8 / 0.66) + len(s) * per_str)
 
 
 class ZimItem(Item):
@@ -72,6 +109,25 @@ def _iter_entries(archive):
             yield entry.path, entry
 
 
+def _index_archive(archive, label):
+    """Build a {path: entry_id} index for an archive, with progress bar.
+
+    Returns dict mapping path -> entry_id (int), which is much lighter
+    than holding entry objects.
+    """
+    total = archive.all_entry_count
+    index = {}
+    with tqdm(range(total), desc=f"Indexing {label}", unit=" entries",
+              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
+        for i in pbar:
+            entry = archive._get_entry_by_id(i)
+            if archive.has_entry_by_path(entry.path):
+                index[entry.path] = i
+    mem_est = _estimate_set_mem(set(index.keys()))
+    print(f"  {len(index):,} entries indexed, ~{_fmt(mem_est)} path memory, RSS {_rss_mb()}")
+    return index
+
+
 def _resolve_main_entry(archive):
     """Follow redirects to find the main entry's content path."""
     if not archive.has_main_entry:
@@ -100,16 +156,14 @@ def _read_overlay_metadata(archive):
 
 
 # ---------------------------------------------------------------------------
-# Overlay reader: presents base + overlays as a unified view
+# Overlay reader
 # ---------------------------------------------------------------------------
 
 
 class OverlayReader:
     """Read from a base ZIM with overlay ZIMs stacked on top.
 
-    Entry resolution order: last overlay → ... → first overlay → base.
-    If an entry is in any overlay's deletion list and no later overlay
-    re-adds it, it is considered deleted.
+    Entry resolution order: last overlay -> ... -> first overlay -> base.
     """
 
     def __init__(self, base_path, overlay_paths=None):
@@ -124,37 +178,30 @@ class OverlayReader:
 
     def get_entry(self, path):
         """Return (archive, entry) for a path, or None if deleted/missing."""
-        # Check overlays newest-first
         for i in range(len(self.overlays) - 1, -1, -1):
             overlay = self.overlays[i]
             if overlay.has_entry_by_path(path):
                 return overlay, overlay.get_entry_by_path(path)
             if path in self._deleted_sets[i]:
                 return None
-        # Fall back to base
         if self.base.has_entry_by_path(path):
             return self.base, self.base.get_entry_by_path(path)
         return None
 
     def iter_paths(self):
         """Yield all live paths across base + overlays."""
-        # Collect all paths, tracking which are deleted
         all_deleted = set()
         overlay_paths = set()
 
-        # Walk overlays newest-first to build deletion set
         for i in range(len(self.overlays) - 1, -1, -1):
             for path, _ in _iter_entries(self.overlays[i]):
                 overlay_paths.add(path)
-            # Paths in this deletion list are dead unless a newer overlay added them
             for path in self._deleted_sets[i]:
                 if path not in overlay_paths:
                     all_deleted.add(path)
 
-        # Yield overlay paths
         yield from overlay_paths
 
-        # Yield base paths that aren't deleted or overridden
         for path, _ in _iter_entries(self.base):
             if path not in overlay_paths and path not in all_deleted:
                 yield path
@@ -170,51 +217,64 @@ def cmd_diff(args):
     old = Archive(args.old)
     new = Archive(args.new)
 
-    print(f"Old: {old.entry_count} entries ({old.filesize / 1024 / 1024:.1f} MB) [{old.uuid}]")
-    print(f"New: {new.entry_count} entries ({new.filesize / 1024 / 1024:.1f} MB) [{new.uuid}]")
+    print(f"Old: {old.entry_count:,} entries ({_fmt(old.filesize)}) [{old.uuid}]")
+    print(f"New: {new.entry_count:,} entries ({_fmt(new.filesize)}) [{new.uuid}]")
+    print(f"Initial RSS: {_rss_mb()}")
+    print()
 
-    old_paths = {}
-    for path, entry in _iter_entries(old):
-        old_paths[path] = entry
+    # Phase 1-2: Index both archives (store entry IDs, not objects)
+    old_index = _index_archive(old, "old")
+    new_index = _index_archive(new, "new")
 
-    new_paths = {}
-    for path, entry in _iter_entries(new):
-        new_paths[path] = entry
+    old_paths = set(old_index.keys())
+    new_paths = set(new_index.keys())
+    added_keys = sorted(new_paths - old_paths)
+    removed_keys = sorted(old_paths - new_paths)
+    common_keys = sorted(old_paths & new_paths)
 
-    added_keys = set(new_paths) - set(old_paths)
-    removed_keys = set(old_paths) - set(new_paths)
-    common_keys = set(old_paths) & set(new_paths)
+    print(f"\n  Added:  {len(added_keys):,}  Removed: {len(removed_keys):,}  Common: {len(common_keys):,}")
+    mem_total = _estimate_set_mem(old_paths) + _estimate_set_mem(new_paths)
+    print(f"  Path index memory: ~{_fmt(mem_total)}, RSS: {_rss_mb()}")
 
-    # Find modified entries
-    modified_keys = set()
-    t0 = time.time()
-    for path in common_keys:
-        old_e = old_paths[path]
-        new_e = new_paths[path]
+    # Phase 3: Compare common entries
+    modified_keys = []
+    peak_buf = 0
+    content_compared = 0
 
-        if old_e.title != new_e.title:
-            modified_keys.add(path)
-            continue
-        if old_e.is_redirect != new_e.is_redirect:
-            modified_keys.add(path)
-            continue
-        if old_e.is_redirect:
-            if old_e.get_redirect_entry().path != new_e.get_redirect_entry().path:
-                modified_keys.add(path)
-            continue
-        if bytes(old_e.get_item().content) != bytes(new_e.get_item().content):
-            modified_keys.add(path)
+    with tqdm(common_keys, desc="Comparing", unit=" entries",
+              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
+        for path in pbar:
+            old_e = old.get_entry_by_path(path)
+            new_e = new.get_entry_by_path(path)
 
-    elapsed = time.time() - t0
-    changed_keys = added_keys | modified_keys
+            if old_e.title != new_e.title:
+                modified_keys.append(path)
+                continue
+            if old_e.is_redirect != new_e.is_redirect:
+                modified_keys.append(path)
+                continue
+            if old_e.is_redirect:
+                if old_e.get_redirect_entry().path != new_e.get_redirect_entry().path:
+                    modified_keys.append(path)
+                continue
 
-    print(f"Compared {len(common_keys)} entries in {elapsed:.1f}s")
-    print(f"  Added:     {len(added_keys)}")
-    print(f"  Modified:  {len(modified_keys)}")
-    print(f"  Removed:   {len(removed_keys)}")
-    print(f"  Unchanged: {len(common_keys) - len(modified_keys)}")
+            old_content = bytes(old_e.get_item().content)
+            new_content = bytes(new_e.get_item().content)
+            buf_size = len(old_content) + len(new_content)
+            if buf_size > peak_buf:
+                peak_buf = buf_size
+            content_compared += buf_size
 
-    # Collect new-file metadata to propagate
+            if old_content != new_content:
+                modified_keys.append(path)
+
+    changed_keys = added_keys + modified_keys
+
+    print(f"  Modified: {len(modified_keys):,}, Unchanged: {len(common_keys) - len(modified_keys):,}")
+    print(f"  Content compared: {_fmt(content_compared)}, Peak buffer: {_fmt(peak_buf)}")
+    print(f"  RSS: {_rss_mb()}")
+
+    # Collect new-file metadata
     new_metadata = {}
     for key in new.metadata_keys:
         try:
@@ -222,7 +282,6 @@ def cmd_diff(args):
         except Exception:
             pass
 
-    # Determine language
     lang = "eng"
     if "Language" in new_metadata:
         try:
@@ -232,21 +291,20 @@ def cmd_diff(args):
 
     main_entry = _resolve_main_entry(new)
 
-    print(f"Writing overlay: {args.output}")
+    # Phase 4: Write overlay
+    print(f"\nWriting overlay: {args.output}")
+    content_bytes = 0
     with Creator(args.output).config_indexing(False, lang) as creator:
         if main_entry:
             creator.set_mainpath(main_entry)
 
-        # Write overlay metadata
         creator.add_metadata(VERSION_META_KEY, str(OVERLAY_VERSION))
         creator.add_metadata(BASE_UUID_META_KEY, str(old.uuid))
         creator.add_metadata(BASE_CHECKSUM_META_KEY, old.checksum)
         creator.add_metadata(TARGET_UUID_META_KEY, str(new.uuid))
-        # For first overlay, parent == base
         creator.add_metadata(PARENT_UUID_META_KEY, str(old.uuid))
         creator.add_metadata(DELETION_META_KEY, json.dumps(sorted(removed_keys)))
 
-        # Propagate essential content metadata from the new file
         for key in ("Title", "Description", "Creator", "Publisher", "Date",
                     "Language", "Tags", "Name", "Source", "Flavour", "Scraper"):
             if key in new_metadata:
@@ -256,37 +314,37 @@ def cmd_diff(args):
         if "Illustration_48x48@1" in new_metadata:
             creator.add_metadata("Illustration_48x48@1", new_metadata["Illustration_48x48@1"])
 
-        # Write all changed/added entries
-        content_bytes = 0
-        for path in sorted(changed_keys):
-            entry = new_paths[path]
-            if entry.is_redirect:
-                target = entry.get_redirect_entry().path
-                creator.add_redirection(path, entry.title, target,
-                                        {Hint.FRONT_ARTICLE: False})
-            else:
-                item = entry.get_item()
-                content = bytes(item.content)
-                content_bytes += len(content)
-                creator.add_item(ZimItem(path, entry.title, item.mimetype, content))
+        with tqdm(sorted(changed_keys), desc="Writing overlay", unit=" entries",
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
+            for path in pbar:
+                entry = new.get_entry_by_path(path)
+                if entry.is_redirect:
+                    target = entry.get_redirect_entry().path
+                    creator.add_redirection(path, entry.title, target,
+                                            {Hint.FRONT_ARTICLE: False})
+                else:
+                    item = entry.get_item()
+                    content = bytes(item.content)
+                    content_bytes += len(content)
+                    creator.add_item(ZimItem(path, entry.title, item.mimetype, content))
 
     overlay_size = os.path.getsize(args.output)
-    print(f"Done. Overlay: {overlay_size / 1024 / 1024:.1f} MB "
-          f"({len(changed_keys)} entries, "
-          f"{content_bytes / 1024 / 1024:.1f} MB content)")
-    print(f"vs full download: {new.filesize / 1024 / 1024:.1f} MB "
-          f"({overlay_size * 100 / new.filesize:.0f}% of full)")
+    print(f"\nDone. Overlay: {_fmt(overlay_size)} "
+          f"({len(changed_keys):,} entries, {_fmt(content_bytes)} content)")
+    print(f"vs full download: {_fmt(new.filesize)} "
+          f"({overlay_size * 100 / new.filesize:.1f}% of full)")
+    print(f"Final RSS: {_rss_mb()}")
 
 
 def cmd_apply(args):
     """Flatten base + overlays into a single updated ZIM."""
     reader = OverlayReader(args.base, args.overlays)
 
-    base_size = reader.base.filesize / 1024 / 1024
-    overlay_sizes = sum(ov.filesize for ov in reader.overlays) / 1024 / 1024
-    print(f"Base: {base_size:.1f} MB, Overlays: {overlay_sizes:.1f} MB ({len(reader.overlays)} layers)")
+    base_size = reader.base.filesize
+    overlay_sizes = sum(ov.filesize for ov in reader.overlays)
+    print(f"Base: {_fmt(base_size)}, Overlays: {_fmt(overlay_sizes)} ({len(reader.overlays)} layers)")
+    print(f"Initial RSS: {_rss_mb()}")
 
-    # Use metadata from the newest overlay
     top = reader.overlays[-1] if reader.overlays else reader.base
 
     lang = "eng"
@@ -297,12 +355,16 @@ def cmd_apply(args):
 
     main_entry = _resolve_main_entry(top)
 
+    # Pre-collect paths so we can show a progress bar
+    print("Collecting entry paths...")
+    all_paths = list(reader.iter_paths())
+    print(f"  {len(all_paths):,} live entries")
+
     print(f"Writing {args.output}...")
     with Creator(args.output).config_indexing(True, lang) as creator:
         if main_entry:
             creator.set_mainpath(main_entry)
 
-        # Copy metadata from newest overlay (which has the target version's metadata)
         for key in top.metadata_keys:
             if key.startswith("zimdiff.") or key == "Counter":
                 continue
@@ -312,25 +374,27 @@ def cmd_apply(args):
             except Exception:
                 pass
 
-        # Write all live entries
-        count = 0
-        for path in reader.iter_paths():
-            result = reader.get_entry(path)
-            if result is None:
-                continue
-            _, entry = result
-            if entry.is_redirect:
-                target = entry.get_redirect_entry().path
-                creator.add_redirection(path, entry.title, target,
-                                        {Hint.FRONT_ARTICLE: False})
-            else:
-                item = entry.get_item()
-                content = bytes(item.content)
-                creator.add_item(ZimItem(path, entry.title, item.mimetype, content))
-            count += 1
+        content_bytes = 0
+        with tqdm(all_paths, desc="Writing", unit=" entries",
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
+            for path in pbar:
+                result = reader.get_entry(path)
+                if result is None:
+                    continue
+                _, entry = result
+                if entry.is_redirect:
+                    target = entry.get_redirect_entry().path
+                    creator.add_redirection(path, entry.title, target,
+                                            {Hint.FRONT_ARTICLE: False})
+                else:
+                    item = entry.get_item()
+                    content = bytes(item.content)
+                    content_bytes += len(content)
+                    creator.add_item(ZimItem(path, entry.title, item.mimetype, content))
 
-    output_size = os.path.getsize(args.output) / 1024 / 1024
-    print(f"Done. {count} entries, {output_size:.1f} MB")
+    output_size = os.path.getsize(args.output)
+    print(f"Done. {len(all_paths):,} entries, {_fmt(output_size)}")
+    print(f"Final RSS: {_rss_mb()}")
 
 
 def cmd_info(args):
@@ -340,32 +404,29 @@ def cmd_info(args):
 
     if meta is None:
         print(f"{args.overlay} is not a zimdiff overlay (no zimdiff metadata).")
-        print(f"  Entries: {archive.entry_count}")
-        print(f"  Size: {archive.filesize / 1024 / 1024:.1f} MB")
+        print(f"  Entries: {archive.entry_count:,}")
+        print(f"  Size: {_fmt(archive.filesize)}")
         return
 
     print(f"ZIM Overlay v{meta['version']}")
     print(f"File:        {args.overlay}")
-    print(f"Size:        {archive.filesize / 1024 / 1024:.1f} MB")
+    print(f"Size:        {_fmt(archive.filesize)}")
     print(f"Base UUID:   {meta['base_uuid']}")
     print(f"Target UUID: {meta['target_uuid']}")
     print(f"Parent UUID: {meta['parent_uuid']}")
     print()
 
-    # Count overlay entries (excluding metadata-only)
     entries = list(_iter_entries(archive))
     items = [(p, e) for p, e in entries if not e.is_redirect]
     redirects = [(p, e) for p, e in entries if e.is_redirect]
 
-    print(f"Changed entries: {len(entries)} ({len(items)} items, {len(redirects)} redirects)")
-    print(f"Deleted paths:   {len(meta['deleted'])}")
+    print(f"Changed entries: {len(entries):,} ({len(items):,} items, {len(redirects):,} redirects)")
+    print(f"Deleted paths:   {len(meta['deleted']):,}")
     print()
 
-    # Content size
     total_content = sum(e.get_item().size for _, e in items)
-    print(f"Content payload: {total_content / 1024 / 1024:.1f} MB (uncompressed)")
+    print(f"Content payload: {_fmt(total_content)} (uncompressed)")
 
-    # Show content metadata
     for key in ("Title", "Date", "Description", "Creator"):
         try:
             val = archive.get_metadata(key).decode("utf-8")
@@ -373,18 +434,18 @@ def cmd_info(args):
         except Exception:
             pass
 
-    # Largest entries
     if items:
         print()
         print("Largest entries:")
         by_size = sorted(items, key=lambda x: x[1].get_item().size, reverse=True)
         for path, entry in by_size[:10]:
-            print(f"  {entry.get_item().size:>10,} bytes  {path[:70]}")
+            print(f"  {entry.get_item().size:>12,} bytes  {path[:70]}")
 
     if meta["deleted"]:
         print()
-        print(f"Sample deleted paths ({min(10, len(meta['deleted']))} of {len(meta['deleted'])}):")
-        for path in meta["deleted"][:10]:
+        n = min(10, len(meta["deleted"]))
+        print(f"Sample deleted paths ({n} of {len(meta['deleted']):,}):")
+        for path in meta["deleted"][:n]:
             print(f"  {path}")
 
 
@@ -393,60 +454,64 @@ def cmd_verify(args):
     reader = OverlayReader(args.base, args.overlays)
     ref = Archive(args.reference)
 
-    print(f"Reference: {ref.entry_count} entries ({ref.filesize / 1024 / 1024:.1f} MB)")
+    print(f"Reference: {ref.entry_count:,} entries ({_fmt(ref.filesize)})")
     print(f"Base + {len(reader.overlays)} overlay(s)")
+    print(f"Initial RSS: {_rss_mb()}")
 
-    # Build reference map
-    ref_paths = {}
-    for path, entry in _iter_entries(ref):
-        ref_paths[path] = entry
+    # Index reference
+    ref_index = _index_archive(ref, "reference")
+    ref_paths = set(ref_index.keys())
 
-    # Build overlay view
+    # Collect overlay view paths
+    print("Collecting overlay view paths...")
     overlay_paths = set(reader.iter_paths())
 
-    missing = set(ref_paths) - overlay_paths
-    extra = overlay_paths - set(ref_paths)
+    missing = ref_paths - overlay_paths
+    extra = overlay_paths - ref_paths
 
     errors = 0
     if missing:
-        print(f"\nMISSING from overlay view: {len(missing)}")
+        print(f"\nMISSING from overlay view: {len(missing):,}")
         for p in sorted(missing)[:10]:
             print(f"  {p}")
         errors += len(missing)
 
     if extra:
-        print(f"\nEXTRA in overlay view: {len(extra)}")
+        print(f"\nEXTRA in overlay view: {len(extra):,}")
         for p in sorted(extra)[:10]:
             print(f"  {p}")
         errors += len(extra)
 
-    # Compare content of common entries
-    common = overlay_paths & set(ref_paths)
+    common = sorted(overlay_paths & ref_paths)
     mismatches = 0
-    for path in sorted(common):
-        ref_entry = ref_paths[path]
-        result = reader.get_entry(path)
-        if result is None:
-            mismatches += 1
-            continue
-        _, ov_entry = result
 
-        if ref_entry.is_redirect != ov_entry.is_redirect:
-            mismatches += 1
-            continue
-
-        if ref_entry.is_redirect:
-            if ref_entry.get_redirect_entry().path != ov_entry.get_redirect_entry().path:
+    with tqdm(common, desc="Verifying content", unit=" entries",
+              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
+        for path in pbar:
+            ref_entry = ref.get_entry_by_path(path)
+            result = reader.get_entry(path)
+            if result is None:
                 mismatches += 1
-            continue
+                continue
+            _, ov_entry = result
 
-        if bytes(ref_entry.get_item().content) != bytes(ov_entry.get_item().content):
-            mismatches += 1
+            if ref_entry.is_redirect != ov_entry.is_redirect:
+                mismatches += 1
+                continue
+
+            if ref_entry.is_redirect:
+                if ref_entry.get_redirect_entry().path != ov_entry.get_redirect_entry().path:
+                    mismatches += 1
+                continue
+
+            if bytes(ref_entry.get_item().content) != bytes(ov_entry.get_item().content):
+                mismatches += 1
 
     errors += mismatches
-    print(f"\nEntries checked: {len(common)}")
-    print(f"Content mismatches: {mismatches}")
-    print(f"Total errors: {errors}")
+    print(f"\nEntries checked: {len(common):,}")
+    print(f"Content mismatches: {mismatches:,}")
+    print(f"Total errors: {errors:,}")
+    print(f"Final RSS: {_rss_mb()}")
 
     if errors == 0:
         print("\nVERIFIED: overlay view matches reference exactly.")
