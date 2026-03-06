@@ -110,10 +110,14 @@ def _iter_entries(archive):
 
 
 def _index_archive(archive, label):
-    """Build a {path: entry_id} index for an archive, with progress bar.
+    """Build a {path: info_tuple} index with lightweight metadata.
 
-    Returns dict mapping path -> entry_id (int), which is much lighter
-    than holding entry objects.
+    Fast pass (~1M entries/s): captures path, title, redirect info.
+    Avoids get_item() which triggers expensive cluster decompression.
+
+    Info tuples:
+        Redirects: (True, title, target_path)
+        Items:     (False, title, None)  -- mimetype/size deferred
     """
     total = archive.all_entry_count
     index = {}
@@ -121,8 +125,12 @@ def _index_archive(archive, label):
               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
         for i in pbar:
             entry = archive._get_entry_by_id(i)
-            if archive.has_entry_by_path(entry.path):
-                index[entry.path] = i
+            if not archive.has_entry_by_path(entry.path):
+                continue
+            if entry.is_redirect:
+                index[entry.path] = (True, entry.title, entry.get_redirect_entry().path)
+            else:
+                index[entry.path] = (False, entry.title, None)
     mem_est = _estimate_set_mem(set(index.keys()))
     print(f"  {len(index):,} entries indexed, ~{_fmt(mem_est)} path memory, RSS {_rss_mb()}")
     return index
@@ -222,7 +230,9 @@ def cmd_diff(args):
     print(f"Initial RSS: {_rss_mb()}")
     print()
 
-    # Phase 1-2: Index both archives (store entry IDs, not objects)
+    # Phase 1-2: Index both archives with full metadata
+    # Captures (is_redirect, title, mimetype/target, size) per entry during
+    # sequential scan so the comparison phase needs zero archive lookups.
     old_index = _index_archive(old, "old")
     new_index = _index_archive(new, "new")
 
@@ -236,66 +246,80 @@ def cmd_diff(args):
     mem_total = _estimate_set_mem(old_paths) + _estimate_set_mem(new_paths)
     print(f"  Path index memory: ~{_fmt(mem_total)}, RSS: {_rss_mb()}")
 
-    # Phase 3: Compare common entries
-    # Optimization: check metadata (title, type, mimetype, size) before reading
-    # full content. For large ZIMs most time is spent decompressing content from
-    # disk, so skipping unnecessary reads is critical.
+    # Phase 3a: Compare redirects in-memory (instant, no I/O)
     modified_keys = []
-    peak_buf = 0
-    content_compared = 0
+    common_items = []  # items present in both — need deeper comparison
     skipped_by_meta = 0
 
-    with tqdm(common_keys, desc="Comparing", unit=" entries", miniters=100,
-              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}") as pbar:
-        for path in pbar:
-            old_e = old.get_entry_by_path(path)
-            new_e = new.get_entry_by_path(path)
+    print(f"\nPhase 3a: Comparing {len(common_keys):,} common entries (redirect/title check)...")
+    t0 = time.time()
+    for path in common_keys:
+        old_info = old_index[path]
+        new_info = new_index[path]
 
-            # Fast metadata checks (no disk I/O for content)
-            if old_e.title != new_e.title:
+        # Different type (redirect vs item) or different title
+        if old_info[0] != new_info[0] or old_info[1] != new_info[1]:
+            modified_keys.append(path)
+            skipped_by_meta += 1
+            continue
+
+        # Both redirects — compare targets
+        if old_info[0]:
+            if old_info[2] != new_info[2]:
                 modified_keys.append(path)
                 skipped_by_meta += 1
-                continue
-            if old_e.is_redirect != new_e.is_redirect:
-                modified_keys.append(path)
-                skipped_by_meta += 1
-                continue
-            if old_e.is_redirect:
-                if old_e.get_redirect_entry().path != new_e.get_redirect_entry().path:
+            continue
+
+        # Both items with same title — need size/mimetype/content check
+        common_items.append(path)
+    meta_elapsed = time.time() - t0
+
+    print(f"  {meta_elapsed:.1f}s ({len(common_keys) / max(meta_elapsed, 0.001):,.0f} entries/s)")
+    print(f"  Modified (redirect/title): {skipped_by_meta:,}")
+    print(f"  Items needing comparison: {len(common_items):,}")
+
+    # Phase 3b: Compare item metadata (size/mimetype) then content if needed
+    # This requires get_item() which is slower, but only for the item subset.
+    peak_buf = 0
+    content_compared = 0
+    size_mismatches = 0
+
+    if common_items:
+        with tqdm(common_items, desc="Comparing items", unit=" entries", miniters=100,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}") as pbar:
+            for path in pbar:
+                old_item = old.get_entry_by_path(path).get_item()
+                new_item = new.get_entry_by_path(path).get_item()
+
+                # Fast: compare size and mimetype first
+                if old_item.size != new_item.size or old_item.mimetype != new_item.mimetype:
                     modified_keys.append(path)
-                    skipped_by_meta += 1
-                continue
+                    size_mismatches += 1
+                    pbar.set_postfix_str(
+                        f"mod={len(modified_keys):,} skip={size_mismatches:,} read={_fmt(content_compared)}",
+                        refresh=False)
+                    continue
 
-            old_item = old_e.get_item()
-            new_item = new_e.get_item()
+                # Same size/mimetype — compare content bytes
+                old_content = bytes(old_item.content)
+                new_content = bytes(new_item.content)
+                buf_size = len(old_content) + len(new_content)
+                if buf_size > peak_buf:
+                    peak_buf = buf_size
+                content_compared += buf_size
 
-            # Size/mimetype differ → modified without reading content
-            if old_item.size != new_item.size or old_item.mimetype != new_item.mimetype:
-                modified_keys.append(path)
-                skipped_by_meta += 1
-                continue
+                if old_content != new_content:
+                    modified_keys.append(path)
 
-            # Same size — must compare content bytes
-            old_content = bytes(old_item.content)
-            new_content = bytes(new_item.content)
-            buf_size = len(old_content) + len(new_content)
-            if buf_size > peak_buf:
-                peak_buf = buf_size
-            content_compared += buf_size
-
-            if old_content != new_content:
-                modified_keys.append(path)
-
-            pbar.set_postfix_str(
-                f"mod={len(modified_keys):,} skip={skipped_by_meta:,} read={_fmt(content_compared)}",
-                refresh=False)
+                pbar.set_postfix_str(
+                    f"mod={len(modified_keys):,} skip={size_mismatches:,} read={_fmt(content_compared)}",
+                    refresh=False)
 
     changed_keys = added_keys + modified_keys
 
-    print(f"  Modified: {len(modified_keys):,}, Unchanged: {len(common_keys) - len(modified_keys):,}")
-    print(f"  Skipped by metadata: {skipped_by_meta:,} (no content read needed)")
-    print(f"  Content compared: {_fmt(content_compared)}, Peak buffer: {_fmt(peak_buf)}")
-    print(f"  RSS: {_rss_mb()}")
+    print(f"\n  Total modified: {len(modified_keys):,}, Unchanged: {len(common_keys) - len(modified_keys):,}")
+    print(f"  Size/mime mismatches: {size_mismatches:,}, Content compared: {_fmt(content_compared)}")
+    print(f"  Peak buffer: {_fmt(peak_buf)}, RSS: {_rss_mb()}")
 
     # Collect new-file metadata
     new_metadata = {}
@@ -340,16 +364,16 @@ def cmd_diff(args):
         with tqdm(sorted(changed_keys), desc="Writing overlay", unit=" entries",
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
             for path in pbar:
-                entry = new.get_entry_by_path(path)
-                if entry.is_redirect:
-                    target = entry.get_redirect_entry().path
-                    creator.add_redirection(path, entry.title, target,
+                info = new_index[path]
+                is_redirect, title, target_or_none = info
+                if is_redirect:
+                    creator.add_redirection(path, title, target_or_none,
                                             {Hint.FRONT_ARTICLE: False})
                 else:
-                    item = entry.get_item()
+                    item = new.get_entry_by_path(path).get_item()
                     content = bytes(item.content)
                     content_bytes += len(content)
-                    creator.add_item(ZimItem(path, entry.title, item.mimetype, content))
+                    creator.add_item(ZimItem(path, title, item.mimetype, content))
 
     overlay_size = os.path.getsize(args.output)
     print(f"\nDone. Overlay: {_fmt(overlay_size)} "
